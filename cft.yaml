@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CodePipeline and CodeBuild CloudFormation template for Edifecs team.
+Metadata:
+  Generator: USTHP-DevOps-Team
+ 
+Parameters:
+  CodepipelineResourceName:
+    Type: String
+    Description: The name of the CodePipeline resource to be created.
+  CodepipelineRoleARN:
+    Type: String
+    Description: CodePipeline Execution Role ARN.
+  S3PipelineArtifactStore:
+    Type: String
+    Description: The S3 bucket where we store the pipeline and codebuild artifacts.
+  S3CodepipelineObject:
+    Type: String
+    Description: A sample file, used to refer as a sourcefile, as codepipeline mandatorly needs to select an s3 file as source.
+  S3CodepipelineSource:
+    Type: String
+    Description: S3 location to download the required files to the FSx.
+  CodeBuildRoleARN:
+    Type: String
+    Description: CodeBuild Execution Role ARN.
+  VpcId:
+    Type: String
+    Description: The VPC & Subnet should be same as the FSx VPC & Subnet.
+  SubnetId:
+    Type: String
+    Description: The VPC & Subnet should be same as the FSx VPC & Subnet.
+  SecurityGroupID:
+    Type: String
+    Description: The SG should permit two rules permitting ICMP[All Ports] & NFS [Port 2049] access from the VPC.
+  CodeBuildProject1Name:
+    Type: String
+  CodeBuildProject1ArtifactName:
+    Type: String
+  CodeBuildProject2Name:
+    Type: String
+  CodeBuildCustomImageECRPATH:
+    Type: String
+    Description: ECR location of the custom image, used in the CodeBuildProject2Name.
+  FSxName:
+    Type: String
+    Description: Windows File Server name, onto which the file is to be moved.
+ 
+Resources:
+  CodeBuildProject1:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref CodeBuildProject1Name
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+              - echo "Processing file:$objectKey from bucket:$bucketName"
+            build:
+              commands:
+                - echo "Creating directory for S3 download..."
+                - mkdir -p /mnt/s3-download
+                - echo "Downloading file from S3..."
+                - aws s3 cp s3://$bucketName/$objectKey /mnt/s3-download/
+                - echo "File downloaded successfully."
+                - ls -lR /mnt/s3-download/
+          artifacts:
+            files:
+              - '**/*'     # Ensure all files in /mnt/s3-download/ are included
+            base-directory: /mnt/s3-download
+            discard-paths: no
+      Artifacts:
+        Type: S3
+        Location: !Ref S3PipelineArtifactStore
+        Name: !Ref CodeBuildProject1ArtifactName
+        Packaging: NONE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0-23.05.22
+        Type: LINUX_CONTAINER
+        PrivilegedMode: true
+      ServiceRole: !Ref CodeBuildRoleARN
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+      VpcConfig:
+        VpcId: !Ref VpcId
+        Subnets:
+          - !Ref SubnetId
+        SecurityGroupIds:
+          - !Ref SecurityGroupID
+ 
+  CodeBuildProject2:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref CodeBuildProject2Name
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+ 
+          phases:
+            pre_build:
+              commands:
+                - echo "Preparing FSx mount point..."
+                - mkdir -p /mnt/fsx
+                - echo "Extracting directory path from objectKey..."
+                - file_path=$(dirname "$objectKey")
+                - file_name=$(basename "$objectKey")
+ 
+            build:
+              commands:
+                - echo "Listing FSx directory before mounting..."
+                - ls -lR /mnt/fsx
+                - echo "Mounting the FSx file system..."
+                - mount -t nfs -o nfsvers=4.1 $FSxName:/fsx /mnt/fsx || {
+                    echo "Failed to mount FSx. Check FSxName and network configuration.";
+                    exit 1;
+                  }
+                - echo "Verifying FSx mount..."
+                - df -h /mnt/fsx
+                - echo "Checking artifacts in CodeBuild source directory..."
+                - ls -l $CODEBUILD_SRC_DIR
+                - echo "Creating the required directory structure in FSx..."
+                - mkdir -p "/mnt/fsx/s3-download/$file_path"
+                - echo "Copying the downloaded file to FSx..."
+                - cp "$CODEBUILD_SRC_DIR/$file_name" "/mnt/fsx/s3-download/$file_path/$file_name"
+                - echo "File successfully copied to FSx."
+                - echo "Verifying copied file in FSx..."
+                - ls -lR /mnt/fsx/s3-download
+ 
+            post_build:
+              commands:
+                - umount /mnt/fsx || echo "Failed to unmount FSx. Check if it's in use."
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Ref CodeBuildCustomImageECRPATH
+        Type: LINUX_CONTAINER
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: FSxName
+            Value: !Ref FSxName
+      ServiceRole: !Ref CodeBuildRoleARN
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+      VpcConfig:
+        VpcId: !Ref VpcId
+        Subnets:
+          - !Ref SubnetId
+        SecurityGroupIds:
+          - !Ref SecurityGroupID
+ 
+  CodePipelineResource:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Ref CodepipelineResourceName
+      RoleArn: !Ref CodepipelineRoleARN
+      ExecutionMode: PARALLEL
+      ArtifactStore:
+        Location: !Ref S3PipelineArtifactStore
+        Type: S3
+      Variables:
+        - Name: objectKey
+          DefaultValue: objectKey
+        - Name: bucketName
+          DefaultValue: bucketName
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              Namespace: SourceVariables
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: 1
+              Configuration:
+                S3Bucket: !Ref S3CodepipelineSource
+                S3ObjectKey: !Ref S3CodepipelineObject
+              OutputArtifacts:
+                - Name: SourceArtifacts
+              RunOrder: 1
+        - Name: S3Download
+          Actions:
+            - Name: S3Download
+              Namespace: S3DownloadVariables
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              Configuration:
+                ProjectName: !Ref CodeBuildProject1Name
+                EnvironmentVariables: '[{"name": "objectKey", "type": "PLAINTEXT", "value": "#{variables.objectKey}"}, {"name": "bucketName", "type": "PLAINTEXT", "value": "#{variables.bucketName}"}]'
+              InputArtifacts:
+                - Name: SourceArtifacts
+              OutputArtifacts:
+                - Name: S3DownloadArtifacts
+              RunOrder: 2
+        - Name: ManualApproval
+          Actions:
+            - Name: ApprovalAction
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: 1
+              Configuration:
+                NotificationArn:
+                CustomData: "Please review and approve"
+              RunOrder: 3
+        - Name: FSxMount
+          Actions:
+            - Name: FSxMount
+              Namespace: FSxMountVariables
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              Configuration:
+                ProjectName: !Ref CodeBuildProject2Name
+                EnvironmentVariables: '[{"name": "objectKey", "type": "PLAINTEXT", "value": "#{variables.objectKey}"}, {"name": "bucketName", "type": "PLAINTEXT", "value": "#{variables.bucketName}"}]'
+              InputArtifacts:
+                - Name: S3DownloadArtifacts
+              RunOrder: 4
